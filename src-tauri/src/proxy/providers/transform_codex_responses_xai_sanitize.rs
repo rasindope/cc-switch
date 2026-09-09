@@ -777,7 +777,7 @@ fn request_model_is_allowed(
 /// (`xai/grok-4.6-fast`). Real Grok SKUs the catalog has not caught up with —
 /// a brand-new model, or one hand-picked via Codex `/model` on a card without
 /// a catalog — must pass through; only alien subagent SKUs are remapped.
-fn request_is_grok_model(request: &str) -> bool {
+pub(crate) fn request_is_grok_model(request: &str) -> bool {
     let mut bare = request.trim();
     if let Some(idx) = bare.rfind('/') {
         bare = bare[idx + 1..].trim();
