@@ -9020,8 +9020,8 @@ command = "latest-command"
                 .await
                 .unwrap();
             let text = crate::codex_config::read_codex_config_text().unwrap();
-            assert!(!text.contains("model_context_window"));
-            assert!(!text.contains("model_auto_compact_token_limit"));
+            assert!(text.contains("model_context_window = 1000000"));
+            assert!(text.contains("model_auto_compact_token_limit = 452000"));
             assert!(crate::codex_config::routing_catalog_is_live());
             assert!(
                 crate::codex_config::read_codex_model_catalog_simplified_from_live()

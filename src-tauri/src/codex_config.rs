@@ -2452,12 +2452,7 @@ pub fn prepare_codex_config_text_with_model_catalog(
     let catalog_path = get_codex_model_catalog_path();
 
     if let Some(catalog) = settings.get("modelRoutingCatalog") {
-        let mut doc = config_text
-            .parse::<DocumentMut>()
-            .map_err(|e| AppError::Message(e.to_string()))?;
-        doc.as_table_mut().remove("model_context_window");
-        doc.as_table_mut().remove("model_auto_compact_token_limit");
-        let text = set_codex_model_catalog_json_field(&doc.to_string(), Some(&catalog_path))?;
+        let text = set_codex_model_catalog_json_field(config_text, Some(&catalog_path))?;
         if resolve_cc_switch_catalog_path(&text, &get_codex_config_dir()).is_some() {
             write_json_file(&catalog_path, catalog)?;
         }
