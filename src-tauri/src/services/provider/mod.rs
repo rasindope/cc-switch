@@ -4476,6 +4476,20 @@ impl ProviderService {
         Self::validate_provider_settings(&app_type, &provider)?;
         normalize_provider_common_config_for_storage(state.db.as_ref(), &app_type, &mut provider)?;
         Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
+
+        if app_type == AppType::Codex {
+            let routing = crate::proxy::model_routing::ModelRoutingConfig::load(&state.db)?;
+            if routing
+                .rules
+                .iter()
+                .any(|rule| rule.provider_id == provider.id)
+                && crate::proxy::providers::is_codex_official_provider(&provider)
+            {
+                return Err(AppError::Message(
+                    "请先解除模型路由引用，再将供应商改为官方 OAuth 类型".into(),
+                ));
+            }
+        }
         if app_type.is_additive_mode() {
             Self::set_provider_live_config_managed(&mut provider, add_to_live);
         }
@@ -4607,6 +4621,19 @@ impl ProviderService {
         let existing_provider = state
             .db
             .get_provider_by_id(&original_id, app_type.as_str())?;
+        if app_type == AppType::Codex {
+            let routing = crate::proxy::model_routing::ModelRoutingConfig::load(&state.db)?;
+            if routing
+                .rules
+                .iter()
+                .any(|rule| rule.provider_id == original_id)
+                && crate::proxy::providers::is_codex_official_provider(&provider)
+            {
+                return Err(AppError::Message(
+                    "请先解除模型路由引用，再将供应商改为官方 OAuth 类型".into(),
+                ));
+            }
+        }
         // Normalize Claude model keys
         Self::normalize_provider_if_claude(&app_type, &mut provider);
         Self::validate_provider_settings(&app_type, &provider)?;
@@ -4899,6 +4926,69 @@ impl ProviderService {
             return Ok(true);
         }
 
+        if app_type == AppType::Codex {
+            let routing = crate::proxy::model_routing::ModelRoutingConfig::load(&state.db)?;
+            if routing.enabled
+                && (is_current
+                    || routing
+                        .rules
+                        .iter()
+                        .any(|rule| rule.enabled && rule.provider_id == provider.id))
+                && state
+                    .proxy_service
+                    .detect_takeover_in_live_config_for_app(&app_type)
+            {
+                let snapshot = crate::codex_config::CodexLiveStateSnapshot::capture()?;
+                let previous_backup =
+                    futures::executor::block_on(state.db.get_live_backup("codex"))?;
+                state.db.save_provider(app_type.as_str(), &provider)?;
+                let result = (|| {
+                    routing.validate(&state.db)?;
+                    if state
+                        .proxy_service
+                        .detect_takeover_in_live_config_for_app(&app_type)
+                    {
+                        let id = effective_current
+                            .as_deref()
+                            .ok_or_else(|| AppError::Message("默认供应商不存在".into()))?;
+                        let default = state
+                            .db
+                            .get_provider_by_id(id, "codex")?
+                            .ok_or_else(|| AppError::Message("默认供应商不存在".into()))?;
+                        futures::executor::block_on(
+                            state
+                                .proxy_service
+                                .sync_codex_live_from_provider_while_proxy_active(&default),
+                        )
+                        .map_err(AppError::Message)?;
+                        if is_current {
+                            futures::executor::block_on(
+                                state.proxy_service.update_live_backup_from_provider_inner(
+                                    "codex", &provider, None,
+                                ),
+                            )
+                            .map_err(AppError::Message)?;
+                        }
+                    }
+                    Ok::<(), AppError>(())
+                })();
+                if let Err(error) = result {
+                    if let Some(previous) = existing_provider.as_ref() {
+                        state.db.save_provider("codex", previous)?;
+                    }
+                    snapshot.restore_preserving_newer_same_account_auth()?;
+                    if let Some(backup) = previous_backup {
+                        futures::executor::block_on(
+                            state.db.save_live_backup("codex", &backup.original_config),
+                        )?;
+                    } else {
+                        futures::executor::block_on(state.db.delete_live_backup("codex"))?;
+                    }
+                    return Err(error);
+                }
+                return Ok(true);
+            }
+        }
         drop(codex_update_switch_guard);
 
         // Save to database
@@ -4935,6 +5025,23 @@ impl ProviderService {
     /// 同时检查本地 settings 和数据库的当前供应商，防止删除任一端正在使用的供应商。
     /// 对于累加模式应用（OpenCode, OpenClaw），可以随时删除任意供应商，同时从 live 配置中移除。
     pub fn delete(state: &AppState, app_type: AppType, id: &str) -> Result<(), AppError> {
+        let _routing_guard = if app_type == AppType::Codex {
+            Some(futures::executor::block_on(
+                state.proxy_service.lock_switch_for_app("codex"),
+            ))
+        } else {
+            None
+        };
+        if app_type == AppType::Codex
+            && crate::proxy::model_routing::ModelRoutingConfig::load(&state.db)?
+                .rules
+                .iter()
+                .any(|rule| rule.provider_id == id)
+        {
+            return Err(AppError::Message(
+                "请先解除模型路由规则对该供应商的引用".into(),
+            ));
+        }
         if app_type == AppType::Pi {
             return pi::delete(state, id);
         }

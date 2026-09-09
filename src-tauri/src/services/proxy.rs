@@ -716,6 +716,31 @@ impl ProxyService {
             .await
     }
 
+    /// Project a draft before committing its rules, so requests only observe
+    /// configurations whose catalog/config writes succeeded.
+    pub(crate) async fn sync_codex_live_with_model_routing(
+        &self,
+        provider: &Provider,
+        routing: &crate::proxy::model_routing::ModelRoutingConfig,
+    ) -> Result<(), String> {
+        let mut config = build_effective_provider_for_live_with_codex_oauth_manager(
+            &self.db,
+            &AppType::Codex,
+            provider,
+            &self.codex_oauth_manager,
+        )
+        .map_err(|e| e.to_string())?
+        .settings_config;
+        if let Ok(existing) = self.read_codex_live() {
+            Self::preserve_toml_mcp_servers_from_existing_config(&mut config, &existing)?;
+        }
+        let (_, url) = self.build_proxy_urls().await?;
+        Self::apply_codex_takeover_fields_for_provider(&mut config, &url, provider)?;
+        config["modelRoutingOverride"] =
+            serde_json::to_value(routing).map_err(|e| e.to_string())?;
+        self.write_codex_takeover_live_for_provider(&config, Some(provider))
+    }
+
     pub(crate) async fn sync_codex_live_from_provider_while_proxy_active_guarded(
         &self,
         provider: &Provider,
@@ -1189,6 +1214,15 @@ impl ProxyService {
                 // 只看占位符会把半接管/旧端口残留误判为可复用，导致开启接管后
                 // live 文件仍停留在普通供应商配置。
                 if has_backup && live_matches_current_proxy {
+                    if app == AppType::Codex
+                        && crate::proxy::model_routing::ModelRoutingConfig::load(&self.db)
+                            .map_err(|e| e.to_string())?
+                            .enabled
+                    {
+                        let provider = self.require_current_provider_for_app(&app)?;
+                        self.sync_codex_live_from_provider_while_proxy_active(&provider)
+                            .await?;
+                    }
                     self.refresh_active_target_from_current_provider(&app).await;
                     return Ok(());
                 }
@@ -3657,6 +3691,32 @@ impl ProxyService {
         config: &Value,
         provider: Option<&Provider>,
     ) -> Result<(), String> {
+        let mut routed_config = config.clone();
+        if let Ok(live) = crate::codex_config::read_codex_config_text() {
+            if let Ok(doc) = live.parse::<toml_edit::DocumentMut>() {
+                if let Some(pointer) = doc.get("model_catalog_json").and_then(|v| v.as_str()) {
+                    if crate::codex_config::resolve_cc_switch_catalog_path(
+                        &live,
+                        &crate::codex_config::get_codex_config_dir(),
+                    )
+                    .is_none()
+                    {
+                        let text = routed_config
+                            .get("config")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let mut next = text
+                            .parse::<toml_edit::DocumentMut>()
+                            .map_err(|e| e.to_string())?;
+                        next["model_catalog_json"] = toml_edit::value(pointer);
+                        routed_config["config"] = Value::String(next.to_string());
+                    }
+                }
+            }
+        }
+        crate::proxy::model_routing::attach_catalog(&self.db, &mut routed_config, provider)
+            .map_err(|e| e.to_string())?;
+        let config = &routed_config;
         let official_passthrough =
             provider.is_some_and(crate::proxy::providers::is_codex_official_provider);
         let managed_account_id = provider
@@ -3764,6 +3824,21 @@ impl ProxyService {
         expected_auth: Option<&CodexAuthFileSnapshot>,
     ) -> Result<(), String> {
         use crate::codex_config::{get_codex_auth_path, get_codex_config_path};
+
+        // A snapshot backup only remembers the catalog pointer. The file may
+        // now contain the merged route catalog; reconstruct the selected card
+        // before leaving takeover instead of restoring a pointer to that merge.
+        let mut restore_config = config.clone();
+        if crate::codex_config::routing_catalog_is_live() {
+            if let Ok(provider) = self.require_current_provider_for_app(&AppType::Codex) {
+                restore_config["modelCatalog"] = provider
+                    .settings_config
+                    .get("modelCatalog")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"models": []}));
+            }
+        }
+        let config = &restore_config;
 
         let auth = config.get("auth");
         let config_str = config.get("config").and_then(|v| v.as_str());
@@ -8890,6 +8965,162 @@ command = "latest-command"
             Some("latest-command"),
             "new MCP entries should remain in the restore backup"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn model_routing_catalog_survives_sync_and_restores_without_backfill() {
+        use crate::proxy::model_routing::{
+            MatchType, ModelRouteRule, ModelRoutingConfig, SETTINGS_KEY,
+        };
+        let _home = TempHome::new();
+        crate::settings::reload_settings().unwrap();
+        let db = Arc::new(Database::memory().unwrap());
+        let state = crate::store::AppState::new(db.clone());
+        let make = |id: &str, model: &str, context: u64| {
+            let mut p = Provider::with_id(
+                id.into(),
+                id.into(),
+                json!({
+                    "auth":{"OPENAI_API_KEY":"test-only"},
+                    "config": format!("model_provider = \"custom\"\nmodel = \"{model}\"\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 452000\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:1\"\nwire_api = \"responses\"\n"),
+                    "modelCatalog":{"models":[{"model":model,"contextWindow":context}]}
+                }),
+                None,
+            );
+            p.meta = Some(crate::provider::ProviderMeta {
+                api_format: Some("openai_responses".into()),
+                ..Default::default()
+            });
+            p
+        };
+        let gpt = make("gpt", "gpt-test", 32000);
+        let grok = make("grok", "grok-test", 64000);
+        db.save_provider("codex", &gpt).unwrap();
+        db.save_provider("codex", &grok).unwrap();
+        db.set_current_provider("codex", "gpt").unwrap();
+        crate::settings::set_current_provider(&AppType::Codex, Some("gpt")).unwrap();
+        let config = ModelRoutingConfig {
+            version: 1,
+            enabled: true,
+            rules: vec![ModelRouteRule {
+                id: "grok".into(),
+                enabled: true,
+                match_type: MatchType::Prefix,
+                pattern: "grok-".into(),
+                provider_id: "grok".into(),
+            }],
+        };
+        db.set_setting(SETTINGS_KEY, &serde_json::to_string(&config).unwrap())
+            .unwrap();
+        for _ in 0..2 {
+            state
+                .proxy_service
+                .sync_codex_live_from_provider_while_proxy_active(&gpt)
+                .await
+                .unwrap();
+            let text = crate::codex_config::read_codex_config_text().unwrap();
+            assert!(!text.contains("model_context_window"));
+            assert!(!text.contains("model_auto_compact_token_limit"));
+            assert!(crate::codex_config::routing_catalog_is_live());
+            assert!(
+                crate::codex_config::read_codex_model_catalog_simplified_from_live()
+                    .unwrap()
+                    .is_none()
+            );
+            let catalog: Value = serde_json::from_slice(
+                &std::fs::read(crate::codex_config::get_codex_model_catalog_path()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(catalog["models"].as_array().unwrap().len(), 2);
+        }
+        let mut proxy_config = db.get_proxy_config_for_app("codex").await.unwrap();
+        proxy_config.enabled = true;
+        db.update_proxy_config_for_app(proxy_config).await.unwrap();
+        let before_text = crate::codex_config::read_codex_config_text().unwrap();
+        let before_catalog =
+            std::fs::read(crate::codex_config::get_codex_model_catalog_path()).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("CREATE TRIGGER reject_route_save BEFORE INSERT ON settings WHEN NEW.key = 'codex_model_routing_v1' BEGIN SELECT RAISE(ABORT, 'test write failure'); END;").unwrap();
+        }
+        let disabled = ModelRoutingConfig {
+            enabled: false,
+            ..config.clone()
+        };
+        assert!(
+            crate::commands::save_model_routing_config(&state, disabled.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::codex_config::read_codex_config_text().unwrap(),
+            before_text
+        );
+        assert_eq!(
+            std::fs::read(crate::codex_config::get_codex_model_catalog_path()).unwrap(),
+            before_catalog
+        );
+        assert_eq!(ModelRoutingConfig::load(&db).unwrap(), config);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("DROP TRIGGER reject_route_save")
+                .unwrap();
+        }
+        assert!(crate::services::ProviderService::delete(&state, AppType::Codex, "grok").is_err());
+        let mut updated_grok = grok.clone();
+        updated_grok.settings_config["modelCatalog"]["models"][0]["model"] = json!("grok-updated");
+        crate::services::ProviderService::update(&state, AppType::Codex, None, updated_grok)
+            .unwrap();
+        let updated_catalog =
+            std::fs::read_to_string(crate::codex_config::get_codex_model_catalog_path()).unwrap();
+        assert!(updated_catalog.contains("grok-updated"));
+        assert!(!updated_catalog.contains("grok-test"));
+        let saved = crate::commands::save_model_routing_config(&state, disabled.clone())
+            .await
+            .unwrap();
+        assert!(saved.restart_required);
+        db.set_setting(SETTINGS_KEY, &serde_json::to_string(&config).unwrap())
+            .unwrap();
+        state
+            .proxy_service
+            .sync_codex_live_with_model_routing(&gpt, &disabled)
+            .await
+            .unwrap();
+        assert!(!crate::codex_config::routing_catalog_is_live());
+        assert!(crate::codex_config::read_codex_config_text()
+            .unwrap()
+            .contains("model_context_window = 1000000"));
+        let external = crate::codex_config::get_codex_config_dir().join("my-models.json");
+        std::fs::write(&external, "{\"models\":[]}").unwrap();
+        let mut text = crate::codex_config::read_codex_config_text()
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        text["model_catalog_json"] = toml_edit::value(external.to_str().unwrap());
+        crate::codex_config::write_codex_live_config_atomic(Some(&text.to_string())).unwrap();
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&gpt)
+            .await
+            .unwrap();
+        assert!(crate::codex_config::read_codex_config_text()
+            .unwrap()
+            .contains("my-models.json"));
+        assert_eq!(
+            std::fs::read_to_string(&external).unwrap(),
+            "{\"models\":[]}"
+        );
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&gpt)
+            .await
+            .unwrap();
+        state
+            .proxy_service
+            .write_codex_live_verbatim(&gpt.settings_config)
+            .unwrap();
+        assert!(!crate::codex_config::routing_catalog_is_live());
     }
 
     #[tokio::test]

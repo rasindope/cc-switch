@@ -33,6 +33,7 @@ pub struct StreamingTimeoutConfig {
 /// - 日志标签
 /// - Session ID（用于日志关联）
 pub struct RequestContext {
+    pub model_route_id: Option<String>,
     /// 请求开始时间
     pub start_time: Instant,
     /// 应用级代理配置（per-app，包含重试次数和超时配置）
@@ -131,9 +132,9 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
+        let selection = state
             .provider_router
-            .select_providers(app_type_str)
+            .select_for_model(app_type_str, &request_model)
             .await
             .map_err(|e| match e {
                 crate::error::AppError::AllProvidersCircuitOpen => {
@@ -142,6 +143,7 @@ impl RequestContext {
                 crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
+        let providers = selection.providers;
 
         let provider = providers
             .first()
@@ -158,6 +160,7 @@ impl RequestContext {
         );
 
         Ok(Self {
+            model_route_id: selection.model_route_id,
             start_time,
             app_config,
             provider,
@@ -242,6 +245,7 @@ impl RequestContext {
             self.copilot_optimizer_config.clone(),
             max_retries,
         )
+        .with_model_route(self.model_route_id.clone())
     }
 
     /// 获取 Provider 列表（用于故障转移）

@@ -32,6 +32,7 @@ import type {
   ToolInstallationReport,
 } from "@/lib/api/settings";
 import { useUpdate } from "@/contexts/UpdateContext";
+import { CUSTOM_BUILD } from "@/lib/updater";
 import { Badge } from "@/components/ui/badge";
 import { motion } from "framer-motion";
 import appIcon from "@/assets/icons/app-icon.png";
@@ -940,7 +941,10 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
               type="button"
               size="sm"
               onClick={handleCheckUpdate}
-              disabled={isChecking || isDownloading}
+              disabled={CUSTOM_BUILD || isChecking || isDownloading}
+              title={
+                CUSTOM_BUILD ? "自用模型路由版本：官方更新已关闭" : undefined
+              }
               className="h-8 gap-1.5 text-xs"
             >
               {isDownloading ? (

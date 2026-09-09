@@ -2013,6 +2013,54 @@ fn load_codex_model_template_from_bundled() -> Result<Option<Value>, AppError> {
     Ok(None)
 }
 
+/// Preserve complete GPT model metadata when importing the installed Codex catalog.
+pub(crate) fn load_routing_gpt_models() -> Vec<Value> {
+    let extract = |catalog: Value| -> Vec<Value> {
+        catalog
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|m| {
+                m.get("slug")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.starts_with("gpt-"))
+            })
+            .map(|entry| {
+                let mut entry = entry.clone();
+                fill_template_fields_from_static(&mut entry);
+                entry
+            })
+            .collect()
+    };
+    let cache = get_codex_config_dir().join("models_cache.json");
+    if let Ok(text) = read_limited_string(&cache, MAX_CODEX_CATALOG_BYTES) {
+        if let Ok(value) = serde_json::from_str(&text) {
+            let models = extract(value);
+            if !models.is_empty() {
+                return models;
+            }
+        }
+    }
+    let candidates = std::iter::once(PathBuf::from(
+        "/Applications/Codex.app/Contents/Resources/codex",
+    ))
+    .chain(codex_cli_candidates());
+    for candidate in candidates {
+        if let Ok(output) = codex_bundled_models_command(&candidate).output() {
+            if output.status.success() {
+                if let Ok(value) = serde_json::from_slice(&output.stdout) {
+                    let models = extract(value);
+                    if !models.is_empty() {
+                        return models;
+                    }
+                }
+            }
+        }
+    }
+    vec![]
+}
+
 fn load_codex_model_template_static() -> Option<Value> {
     let text = include_str!("resources/gpt5_5_template.json");
     match serde_json::from_str(text) {
@@ -2274,7 +2322,7 @@ fn codex_model_catalog_from_specs(
     json!({ "models": entries })
 }
 
-fn codex_model_catalog_from_settings(
+pub(crate) fn codex_model_catalog_from_settings(
     settings: &Value,
     config_text: &str,
     profile: CodexCatalogToolProfile,
@@ -2403,6 +2451,19 @@ pub fn prepare_codex_config_text_with_model_catalog(
 ) -> Result<String, AppError> {
     let catalog_path = get_codex_model_catalog_path();
 
+    if let Some(catalog) = settings.get("modelRoutingCatalog") {
+        let mut doc = config_text
+            .parse::<DocumentMut>()
+            .map_err(|e| AppError::Message(e.to_string()))?;
+        doc.as_table_mut().remove("model_context_window");
+        doc.as_table_mut().remove("model_auto_compact_token_limit");
+        let text = set_codex_model_catalog_json_field(&doc.to_string(), Some(&catalog_path))?;
+        if resolve_cc_switch_catalog_path(&text, &get_codex_config_dir()).is_some() {
+            write_json_file(&catalog_path, catalog)?;
+        }
+        return Ok(text);
+    }
+
     if let Some(catalog) = codex_model_catalog_from_settings(settings, config_text, profile)? {
         let config_text = set_codex_model_catalog_json_field(config_text, Some(&catalog_path))?;
         // Disable web_search only for native gateways on the reject blacklist
@@ -2477,10 +2538,31 @@ pub fn read_codex_model_catalog_simplified_from_live() -> Result<Option<Value>, 
             return Ok(None);
         }
     };
+    if serde_json::from_str::<Value>(&catalog_text)
+        .ok()
+        .and_then(|v| v.get("_ccSwitchModelRouting").and_then(Value::as_bool))
+        == Some(true)
+    {
+        return Ok(None);
+    }
     Ok(build_simplified_catalog_from_texts(
         &config_text,
         &catalog_text,
     ))
+}
+
+pub(crate) fn routing_catalog_is_live() -> bool {
+    let Ok(text) = read_codex_config_text() else {
+        return false;
+    };
+    let Some(path) = resolve_cc_switch_catalog_path(&text, &get_codex_config_dir()) else {
+        return false;
+    };
+    read_limited_string(&path, MAX_CODEX_CATALOG_BYTES)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.get("_ccSwitchModelRouting").and_then(Value::as_bool))
+        == Some(true)
 }
 
 /// 安全地读取文件为字符串，并在超过字节上限时返回错误。
@@ -2681,7 +2763,7 @@ pub fn prepare_codex_live_config_text_with_optional_catalog(
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<String, AppError> {
-    if settings.get("modelCatalog").is_some() {
+    if settings.get("modelCatalog").is_some() || settings.get("modelRoutingCatalog").is_some() {
         prepare_codex_config_text_with_model_catalog(settings, config_text, profile)
     } else {
         Ok(config_text.to_string())

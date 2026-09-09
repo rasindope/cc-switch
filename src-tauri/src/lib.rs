@@ -1369,6 +1369,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_codex_model_routing,
+            commands::save_codex_model_routing,
+            commands::preview_codex_model_routing,
             commands::get_providers,
             commands::get_current_provider,
             commands::add_provider,

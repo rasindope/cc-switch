@@ -11,6 +11,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { ProxyPanel } from "@/components/proxy";
+import { ModelRoutingPanel } from "@/components/proxy/ModelRoutingPanel";
 import { AutoFailoverConfigPanel } from "@/components/proxy/AutoFailoverConfigPanel";
 import { FailoverQueueManager } from "@/components/proxy/FailoverQueueManager";
 import { RectifierConfigPanel } from "@/components/settings/RectifierConfigPanel";
@@ -96,6 +97,7 @@ export function ProxyTabContent({
       className="space-y-4"
     >
       <Accordion type="multiple" defaultValue={[]} className="w-full space-y-4">
+        <ModelRoutingPanel />
         {/* Local Proxy */}
         <AccordionItem
           value="proxy"

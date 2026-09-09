@@ -196,6 +196,10 @@ pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
 /// 这里把退出清理、安装和重启串在同一个后端流程中，避免依赖旧前端继续执行。
 #[tauri::command]
 pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> {
+    const CUSTOM_BUILD: bool = true;
+    if CUSTOM_BUILD {
+        return Err("自用模型路由版本已关闭官方更新，请从 fork 重新构建".into());
+    }
     let updater = app
         .updater_builder()
         .build()

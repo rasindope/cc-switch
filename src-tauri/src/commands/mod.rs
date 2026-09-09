@@ -15,6 +15,8 @@ mod import_export;
 mod mcp;
 mod misc;
 mod model_fetch;
+mod model_routing;
+pub use model_routing::*;
 mod omo;
 mod openclaw;
 mod pi;

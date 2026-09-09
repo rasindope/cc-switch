@@ -156,6 +156,7 @@ impl Drop for ActiveConnectionGuard {
 }
 
 pub struct RequestForwarder {
+    model_route_id: Option<String>,
     /// 共享的 ProviderRouter（持有熔断器状态）
     router: Arc<ProviderRouter>,
     status: Arc<RwLock<ProxyStatus>>,
@@ -260,6 +261,7 @@ impl RequestForwarder {
         // saturating_add 防止 u32::MAX + 1 溢出。
         let max_attempts = (max_retries as usize).saturating_add(1);
         Self {
+            model_route_id: None,
             router,
             status,
             current_providers,
@@ -279,6 +281,11 @@ impl RequestForwarder {
             ),
             max_attempts,
         }
+    }
+
+    pub fn with_model_route(mut self, route_id: Option<String>) -> Self {
+        self.model_route_id = route_id;
+        self
     }
 
     async fn record_success_result(
@@ -545,7 +552,7 @@ impl RequestForwarder {
                         .await;
 
                     // 更新当前应用类型使用的 provider
-                    {
+                    if self.model_route_id.is_none() {
                         let mut current_providers = self.current_providers.write().await;
                         current_providers.insert(
                             app_type_str.to_string(),
@@ -558,8 +565,8 @@ impl RequestForwarder {
                         let mut status = self.status.write().await;
                         status.success_requests += 1;
                         status.last_error = None;
-                        let should_switch =
-                            self.current_provider_id_at_start.as_str() != provider.id.as_str();
+                        let should_switch = self.model_route_id.is_none()
+                            && self.current_provider_id_at_start.as_str() != provider.id.as_str();
                         if should_switch {
                             status.failover_count += 1;
 
@@ -648,7 +655,7 @@ impl RequestForwarder {
                                     )
                                     .await;
 
-                                    {
+                                    if self.model_route_id.is_none() {
                                         let mut current_providers =
                                             self.current_providers.write().await;
                                         current_providers.insert(
@@ -661,8 +668,8 @@ impl RequestForwarder {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
+                                        let should_switch = self.model_route_id.is_none()
+                                            && self.current_provider_id_at_start.as_str()
                                                 != provider.id.as_str();
                                         if should_switch {
                                             status.failover_count += 1;
@@ -793,7 +800,7 @@ impl RequestForwarder {
                                         .await;
 
                                         // 更新当前应用类型使用的 provider
-                                        {
+                                        if self.model_route_id.is_none() {
                                             let mut current_providers =
                                                 self.current_providers.write().await;
                                             current_providers.insert(
@@ -807,8 +814,8 @@ impl RequestForwarder {
                                             let mut status = self.status.write().await;
                                             status.success_requests += 1;
                                             status.last_error = None;
-                                            let should_switch =
-                                                self.current_provider_id_at_start.as_str()
+                                            let should_switch = self.model_route_id.is_none()
+                                                && self.current_provider_id_at_start.as_str()
                                                     != provider.id.as_str();
                                             if should_switch {
                                                 status.failover_count += 1;
@@ -958,7 +965,7 @@ impl RequestForwarder {
                                     )
                                     .await;
 
-                                    {
+                                    if self.model_route_id.is_none() {
                                         let mut current_providers =
                                             self.current_providers.write().await;
                                         current_providers.insert(
@@ -971,8 +978,8 @@ impl RequestForwarder {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
+                                        let should_switch = self.model_route_id.is_none()
+                                            && self.current_provider_id_at_start.as_str()
                                                 != provider.id.as_str();
                                         if should_switch {
                                             status.failover_count += 1;
@@ -1245,7 +1252,9 @@ impl RequestForwarder {
         // 应用模型映射（独立于格式转换）
         // Claude Desktop proxy 模式必须先把 Desktop 可见的 claude-* route
         // 映射成真实上游模型名，并且未知 route 要直接报错，不能使用默认模型兜底。
-        let mapped_body = if matches!(app_type, AppType::ClaudeDesktop) {
+        let mapped_body = if self.model_route_id.is_some() {
+            body.clone()
+        } else if matches!(app_type, AppType::ClaudeDesktop) {
             crate::claude_desktop_config::map_proxy_request_model(body.clone(), provider)
                 .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?
         } else {
@@ -1536,7 +1545,9 @@ impl RequestForwarder {
                     "[Codex] Restored or enriched {restored} cached function call item(s) for Chat upstream"
                 );
             }
-            super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            if self.model_route_id.is_none() {
+                super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            }
             let reasoning_config =
                 super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
             let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
@@ -3858,6 +3869,7 @@ mod tests {
         let db = Arc::new(Database::memory().expect("memory db"));
 
         RequestForwarder {
+            model_route_id: None,
             router: Arc::new(ProviderRouter::new(db.clone())),
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             current_providers: Arc::new(RwLock::new(HashMap::new())),

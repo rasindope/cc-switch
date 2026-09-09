@@ -28,7 +28,38 @@ pub struct ProviderRouter {
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
 }
 
+pub struct ProviderSelection {
+    pub providers: Vec<Provider>,
+    pub model_route_id: Option<String>,
+}
+
 impl ProviderRouter {
+    pub async fn select_for_model(
+        &self,
+        app_type: &str,
+        model: &str,
+    ) -> Result<ProviderSelection, AppError> {
+        if app_type == "codex" {
+            let config = super::model_routing::ModelRoutingConfig::load(&self.db)?;
+            if let Some(rule) = config.matching_rule(model) {
+                let target = super::model_routing::target_provider(&self.db, &rule.provider_id)?;
+                log::info!(
+                    "[Codex model route] rule={} model={} provider={}",
+                    rule.id,
+                    model,
+                    target.id
+                );
+                return Ok(ProviderSelection {
+                    providers: vec![target],
+                    model_route_id: Some(rule.id.clone()),
+                });
+            }
+        }
+        Ok(ProviderSelection {
+            providers: self.select_providers(app_type).await?,
+            model_route_id: None,
+        })
+    }
     /// 创建新的供应商路由器
     pub fn new(db: Arc<Database>) -> Self {
         Self {
